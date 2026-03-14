@@ -1,0 +1,479 @@
+param(
+    [string]$ConfigCsvPath = "C:\Status\FileAgeScan\Config\FileAgeArchiveConfig.csv",
+
+    [string]$OnlyJobName = ""
+)
+
+function Convert-ToBool {
+    param(
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+
+    switch ($Value.Trim().ToLower()) {
+        "true" { return $true }
+        "1"    { return $true }
+        "yes"  { return $true }
+        "ja"   { return $true }
+        default { return $false }
+    }
+}
+
+function Ensure-Directory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        New-Item -Path $Path -ItemType Directory -Force | Out-Null
+    }
+}
+
+function Get-SafeName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+
+    $invalidChars = [System.IO.Path]::GetInvalidFileNameChars()
+    $safe = $Name
+
+    foreach ($char in $invalidChars) {
+        $safe = $safe.Replace($char, '_')
+    }
+
+    return $safe.Trim()
+}
+
+function Get-RelativePathSafe {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$BasePath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$FullPath
+    )
+
+    $base = $BasePath.TrimEnd('\')
+    $full = $FullPath
+
+    if ($full.StartsWith($base, [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $full.Substring($base.Length).TrimStart('\')
+    }
+
+    return $null
+}
+
+function Resolve-TargetFilePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$DesiredPath,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("Skip", "Overwrite", "Rename")]
+        [string]$Mode
+    )
+
+    if (-not (Test-Path -LiteralPath $DesiredPath)) {
+        return $DesiredPath
+    }
+
+    switch ($Mode) {
+        "Skip" {
+            return $null
+        }
+        "Overwrite" {
+            return $DesiredPath
+        }
+        "Rename" {
+            $dir = Split-Path -Path $DesiredPath -Parent
+            $name = [System.IO.Path]::GetFileNameWithoutExtension($DesiredPath)
+            $ext = [System.IO.Path]::GetExtension($DesiredPath)
+
+            for ($i = 1; $i -le 99999; $i++) {
+                $candidate = Join-Path -Path $dir -ChildPath ("{0}_{1}{2}" -f $name, $i, $ext)
+                if (-not (Test-Path -LiteralPath $candidate)) {
+                    return $candidate
+                }
+            }
+
+            throw ("Konnte keinen freien Zieldateinamen erzeugen: {0}" -f $DesiredPath)
+        }
+    }
+}
+
+$script:CurrentLogPath = $null
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    if ([string]::IsNullOrWhiteSpace($script:CurrentLogPath)) {
+        throw "CurrentLogPath ist nicht gesetzt."
+    }
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "{0} : {1}" -f $timestamp, $Message
+    Write-Host $line
+    Add-Content -Path $script:CurrentLogPath -Value $line -Encoding UTF8
+}
+
+function New-ArchiveResult {
+    param(
+        [string]$ConfigName,
+        [string]$ResultJobName,
+        [string]$Mode,
+        [string]$Status,
+        [string]$SourceRootPath,
+        [string]$SourceFile,
+        [string]$RelativePath,
+        [string]$TargetFile,
+        [Int64]$SizeBytes,
+        [string]$Message,
+        [string]$RunTimestamp
+    )
+
+    return [PSCustomObject]@{
+        ConfigName     = $ConfigName
+        ResultJobName  = $ResultJobName
+        Mode           = $Mode
+        Status         = $Status
+        SourceRootPath = $SourceRootPath
+        SourceFile     = $SourceFile
+        RelativePath   = $RelativePath
+        TargetFile     = $TargetFile
+        SizeBytes      = $SizeBytes
+        Message        = $Message
+        RunTimestamp   = $RunTimestamp
+    }
+}
+
+try {
+    if (-not (Test-Path -LiteralPath $ConfigCsvPath)) {
+        throw ("Archiv-Config nicht gefunden: {0}" -f $ConfigCsvPath)
+    }
+
+    $configRows = Import-Csv -Path $ConfigCsvPath -Delimiter ';'
+
+    if (-not $configRows -or @($configRows).Count -eq 0) {
+        throw "Die Archiv-Config enthaelt keine Datensaetze."
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($OnlyJobName)) {
+        $configRows = $configRows | Where-Object { $_.Name -eq $OnlyJobName }
+
+        if (-not $configRows -or @($configRows).Count -eq 0) {
+            throw ("Kein Job mit Name '{0}' in der Archiv-Config gefunden." -f $OnlyJobName)
+        }
+    }
+
+    foreach ($config in $configRows) {
+        $configName       = $config.Name
+        $resultCsvPath    = $config.ResultCsvPath
+        $archiveRoot      = $config.ArchiveRoot
+        $logDirectory     = $config.LogDirectory
+        $resultLogCsvPath = $config.ResultLogCsvPath
+        $onExisting       = $config.OnExisting
+        $mode             = $config.Mode
+        $enabled          = Convert-ToBool -Value $config.Enabled
+        $runTimestamp     = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+
+        if ([string]::IsNullOrWhiteSpace($configName)) {
+            $configName = "UnbenannterArchivJob"
+        }
+
+        if (-not $enabled) {
+            Write-Host ("Job uebersprungen (deaktiviert): {0}" -f $configName)
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($resultCsvPath)) {
+            Write-Host ("FEHLER: Job '{0}' hat keinen ResultCsvPath." -f $configName)
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($archiveRoot)) {
+            Write-Host ("FEHLER: Job '{0}' hat keinen ArchiveRoot." -f $configName)
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($logDirectory)) {
+            Write-Host ("FEHLER: Job '{0}' hat keinen LogDirectory." -f $configName)
+            continue
+        }
+
+        if ($onExisting -notin @("Skip", "Overwrite", "Rename")) {
+            Write-Host ("FEHLER: Job '{0}' hat ungueltiges OnExisting: {1}" -f $configName, $onExisting)
+            continue
+        }
+
+        if ($mode -notin @("Test", "Move")) {
+            Write-Host ("FEHLER: Job '{0}' hat ungueltiges Mode: {1}" -f $configName, $mode)
+            continue
+        }
+
+        Ensure-Directory -Path $logDirectory
+
+        if (-not [string]::IsNullOrWhiteSpace($resultLogCsvPath)) {
+            $resultLogDir = Split-Path -Path $resultLogCsvPath -Parent
+            if (-not [string]::IsNullOrWhiteSpace($resultLogDir)) {
+                Ensure-Directory -Path $resultLogDir
+            }
+        }
+
+        if ($mode -eq "Move") {
+            Ensure-Directory -Path $archiveRoot
+        }
+
+        $script:CurrentLogPath = Join-Path -Path $logDirectory -ChildPath ("FileAgeArchive_{0}_{1}.log" -f (Get-SafeName -Name $configName), (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+        Write-Log "============================================================"
+        Write-Log ("Archivjob gestartet: {0}" -f $configName)
+        Write-Log ("ResultCsvPath    : {0}" -f $resultCsvPath)
+        Write-Log ("ArchiveRoot      : {0}" -f $archiveRoot)
+        Write-Log ("LogPath          : {0}" -f $script:CurrentLogPath)
+        Write-Log ("ResultLogCsvPath : {0}" -f $resultLogCsvPath)
+        Write-Log ("OnExisting       : {0}" -f $onExisting)
+        Write-Log ("Mode             : {0}" -f $mode)
+        Write-Log "============================================================"
+
+        if (-not (Test-Path -LiteralPath $resultCsvPath)) {
+            Write-Log ("KRITISCHER FEHLER: Result-CSV nicht gefunden: {0}" -f $resultCsvPath)
+            continue
+        }
+
+        $rows = Import-Csv -Path $resultCsvPath -Delimiter ';'
+
+        if (-not $rows -or @($rows).Count -eq 0) {
+            Write-Log "Keine Datensaetze in Result-CSV vorhanden."
+            continue
+        }
+
+        $processedCount = 0
+        $movedCount = 0
+        $testCount = 0
+        $skippedCount = 0
+        $failedCount = 0
+        [Int64]$totalBytes = 0
+        $archiveResults = New-Object System.Collections.Generic.List[object]
+
+        foreach ($row in $rows) {
+            $processedCount++
+
+            $resultJobName = $row.JobName
+            $rootPath = $row.RootPath
+            $fullName = $row.FullName
+            $relativePath = ""
+            $resolvedTargetFile = ""
+            [Int64]$sourceBytes = 0
+
+            try {
+                if ([string]::IsNullOrWhiteSpace($resultJobName)) {
+                    $resultJobName = "UnbenannterJob"
+                }
+
+                if ([string]::IsNullOrWhiteSpace($rootPath) -or [string]::IsNullOrWhiteSpace($fullName)) {
+                    $message = "Unvollstaendiger Datensatz in Zeile {0}" -f $processedCount
+                    Write-Log ("UEBERSPRUNGEN: {0}" -f $message)
+                    $skippedCount++
+
+                    [void]$archiveResults.Add((New-ArchiveResult `
+                        -ConfigName $configName `
+                        -ResultJobName $resultJobName `
+                        -Mode $mode `
+                        -Status "SKIPPED" `
+                        -SourceRootPath $rootPath `
+                        -SourceFile $fullName `
+                        -RelativePath "" `
+                        -TargetFile "" `
+                        -SizeBytes 0 `
+                        -Message $message `
+                        -RunTimestamp $runTimestamp))
+
+                    continue
+                }
+
+                if (-not (Test-Path -LiteralPath $fullName)) {
+                    $message = "Quelldatei nicht gefunden"
+                    Write-Log ("UEBERSPRUNGEN: {0}: {1}" -f $message, $fullName)
+                    $skippedCount++
+
+                    [void]$archiveResults.Add((New-ArchiveResult `
+                        -ConfigName $configName `
+                        -ResultJobName $resultJobName `
+                        -Mode $mode `
+                        -Status "SKIPPED" `
+                        -SourceRootPath $rootPath `
+                        -SourceFile $fullName `
+                        -RelativePath "" `
+                        -TargetFile "" `
+                        -SizeBytes 0 `
+                        -Message $message `
+                        -RunTimestamp $runTimestamp))
+
+                    continue
+                }
+
+                $relativePath = Get-RelativePathSafe -BasePath $rootPath -FullPath $fullName
+                if ([string]::IsNullOrWhiteSpace($relativePath)) {
+                    $message = "Relative Pfadbildung fehlgeschlagen"
+                    Write-Log ("UEBERSPRUNGEN: {0}. RootPath='{1}' | FullName='{2}'" -f $message, $rootPath, $fullName)
+                    $skippedCount++
+
+                    [void]$archiveResults.Add((New-ArchiveResult `
+                        -ConfigName $configName `
+                        -ResultJobName $resultJobName `
+                        -Mode $mode `
+                        -Status "SKIPPED" `
+                        -SourceRootPath $rootPath `
+                        -SourceFile $fullName `
+                        -RelativePath "" `
+                        -TargetFile "" `
+                        -SizeBytes 0 `
+                        -Message $message `
+                        -RunTimestamp $runTimestamp))
+
+                    continue
+                }
+
+                $safeResultJobName = Get-SafeName -Name $resultJobName
+                $targetBasePath = Join-Path -Path $archiveRoot -ChildPath $safeResultJobName
+                $targetFilePath = Join-Path -Path $targetBasePath -ChildPath $relativePath
+                $resolvedTargetFile = Resolve-TargetFilePath -DesiredPath $targetFilePath -Mode $onExisting
+
+                if ($null -eq $resolvedTargetFile) {
+                    $message = "Zieldatei existiert bereits"
+                    Write-Log ("UEBERSPRUNGEN: {0}: {1}" -f $message, $targetFilePath)
+                    $skippedCount++
+
+                    [void]$archiveResults.Add((New-ArchiveResult `
+                        -ConfigName $configName `
+                        -ResultJobName $resultJobName `
+                        -Mode $mode `
+                        -Status "SKIPPED" `
+                        -SourceRootPath $rootPath `
+                        -SourceFile $fullName `
+                        -RelativePath $relativePath `
+                        -TargetFile $targetFilePath `
+                        -SizeBytes 0 `
+                        -Message $message `
+                        -RunTimestamp $runTimestamp))
+
+                    continue
+                }
+
+                $sourceInfo = Get-Item -LiteralPath $fullName -Force -ErrorAction Stop
+                $sourceBytes = [Int64]$sourceInfo.Length
+
+                if ($mode -eq "Test") {
+                    $testCount++
+                    $totalBytes += $sourceBytes
+
+                    Write-Log ("TEST: Wuerde verschieben: {0} -> {1}" -f $fullName, $resolvedTargetFile)
+
+                    [void]$archiveResults.Add((New-ArchiveResult `
+                        -ConfigName $configName `
+                        -ResultJobName $resultJobName `
+                        -Mode $mode `
+                        -Status "TEST" `
+                        -SourceRootPath $rootPath `
+                        -SourceFile $fullName `
+                        -RelativePath $relativePath `
+                        -TargetFile $resolvedTargetFile `
+                        -SizeBytes $sourceBytes `
+                        -Message "Wuerde verschoben" `
+                        -RunTimestamp $runTimestamp))
+
+                    continue
+                }
+
+                if ($mode -eq "Move") {
+                    $targetDir = Split-Path -Path $resolvedTargetFile -Parent
+                    if (-not [string]::IsNullOrWhiteSpace($targetDir)) {
+                        Ensure-Directory -Path $targetDir
+                    }
+
+                    if ($onExisting -eq "Overwrite" -and (Test-Path -LiteralPath $resolvedTargetFile)) {
+                        Remove-Item -LiteralPath $resolvedTargetFile -Force -ErrorAction Stop
+                    }
+
+                    Move-Item -LiteralPath $fullName -Destination $resolvedTargetFile -Force -ErrorAction Stop
+
+                    $movedCount++
+                    $totalBytes += $sourceBytes
+
+                    Write-Log ("VERSCHOBEN: {0} -> {1}" -f $fullName, $resolvedTargetFile)
+
+                    [void]$archiveResults.Add((New-ArchiveResult `
+                        -ConfigName $configName `
+                        -ResultJobName $resultJobName `
+                        -Mode $mode `
+                        -Status "MOVED" `
+                        -SourceRootPath $rootPath `
+                        -SourceFile $fullName `
+                        -RelativePath $relativePath `
+                        -TargetFile $resolvedTargetFile `
+                        -SizeBytes $sourceBytes `
+                        -Message "Datei erfolgreich verschoben" `
+                        -RunTimestamp $runTimestamp))
+                }
+            }
+            catch {
+                $failedCount++
+                $errorMessage = $_.Exception.Message
+
+                Write-Log ("FEHLER: {0} | {1}" -f $fullName, $errorMessage)
+
+                [void]$archiveResults.Add((New-ArchiveResult `
+                    -ConfigName $configName `
+                    -ResultJobName $resultJobName `
+                    -Mode $mode `
+                    -Status "FAILED" `
+                    -SourceRootPath $rootPath `
+                    -SourceFile $fullName `
+                    -RelativePath $relativePath `
+                    -TargetFile $resolvedTargetFile `
+                    -SizeBytes $sourceBytes `
+                    -Message $errorMessage `
+                    -RunTimestamp $runTimestamp))
+            }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($resultLogCsvPath)) {
+            if ($archiveResults.Count -gt 0) {
+                if (Test-Path -LiteralPath $resultLogCsvPath) {
+                    $archiveResults |
+                        Export-Csv -Path $resultLogCsvPath -NoTypeInformation -Encoding UTF8 -Delimiter ';' -Append
+                }
+                else {
+                    $archiveResults |
+                        Export-Csv -Path $resultLogCsvPath -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+                }
+
+                Write-Log ("Archiv-Result-CSV exportiert: {0}" -f $resultLogCsvPath)
+            }
+            else {
+                Write-Log "Keine Archiv-Ergebnisse fuer CSV-Export vorhanden."
+            }
+        }
+
+        Write-Log "============================================================"
+        Write-Log ("Archivjob abgeschlossen: {0}" -f $configName)
+        Write-Log ("Verarbeitete Zeilen : {0}" -f $processedCount)
+        Write-Log ("Testfaelle          : {0}" -f $testCount)
+        Write-Log ("Verschoben          : {0}" -f $movedCount)
+        Write-Log ("Uebersprungen       : {0}" -f $skippedCount)
+        Write-Log ("Fehler              : {0}" -f $failedCount)
+        Write-Log ("Datenmenge          : {0:N2} GB ({1} Bytes)" -f ($totalBytes / 1GB), $totalBytes)
+        Write-Log "============================================================"
+    }
+}
+catch {
+    Write-Error $_.Exception.Message
+}

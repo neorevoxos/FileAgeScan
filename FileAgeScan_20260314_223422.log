@@ -1,0 +1,24 @@
+﻿2026-03-14 22:34:22 : ============================================================
+2026-03-14 22:34:22 : Datei-Alterspruefung gestartet
+2026-03-14 22:34:23 : ConfigCsvPath : C:\Status\FileAgeScan\Config\FileAgeScanConfig.csv
+2026-03-14 22:34:23 : LogPath       : C:\Status\FileAgeScan\Logs\FileAgeScan_20260314_223422.log
+2026-03-14 22:34:23 : ResultCsvPath : C:\Status\FileAgeScan\Results\FileAgeScanResults.csv
+2026-03-14 22:34:23 : ============================================================
+2026-03-14 22:34:23 : ------------------------------------------------------------
+2026-03-14 22:34:23 : Job              : NETSTORE2_Dokumente
+2026-03-14 22:34:23 : Pfad             : S:\Test
+2026-03-14 22:34:23 : Dateitypen       : .pdf, .docx, .xlsx
+2026-03-14 22:34:23 : Aelter als       : 1 Jahr(e)
+2026-03-14 22:34:23 : Datumsfeld       : LastWriteTime
+2026-03-14 22:34:23 : Grenzdatum       : 2025-03-14 22:34:23
+2026-03-14 22:34:23 : ------------------------------------------------------------
+2026-03-14 22:34:23 : Ergebnis Job 'NETSTORE2_Dokumente': Dateien=74 | Groesse=130,88 MB (137238564 Bytes)
+2026-03-14 22:34:23 :   .pdf       Anzahl:       74 | Groesse: 130,88 MB
+2026-03-14 22:34:23 : ============================================================
+2026-03-14 22:34:23 : GESAMTZUSAMMENFASSUNG
+2026-03-14 22:34:23 : Verarbeitete Jobs : 1
+2026-03-14 22:34:23 : Gefundene Dateien : 74
+2026-03-14 22:34:23 : Gesamtgroesse     : 130,88 MB (137238564 Bytes)
+2026-03-14 22:34:23 : ============================================================
+2026-03-14 22:34:23 : Ergebnis-CSV exportiert: C:\Status\FileAgeScan\Results\FileAgeScanResults.csv
+2026-03-14 22:34:23 : Pruefung abgeschlossen

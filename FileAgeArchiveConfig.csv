@@ -1,0 +1,3 @@
+Name;ResultCsvPath;ArchiveRoot;LogDirectory;ResultLogCsvPath;OnExisting;Mode;Enabled
+NETSTORE1_Test;C:\Status\FileAgeScan\Results\FileAgeScanResults.csv;S:\TestArchiv;C:\Status\FileAgeScan\ArchiveLogs;C:\Status\FileAgeScan\Results\Archive\NETSTORE1_Test_ArchiveResults.csv;Skip;Test;true
+NETSTORE1_Move;C:\Status\FileAgeScan\Results\FileAgeScanResults.csv;S:\TestArchiv;C:\Status\FileAgeScan\ArchiveLogs;C:\Status\FileAgeScan\Results\Archive\NETSTORE1_Move_ArchiveResults.csv;Skip;Move;false

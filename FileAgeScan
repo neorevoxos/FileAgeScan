@@ -1,0 +1,270 @@
+param(
+    [string]$ConfigCsvPath = "C:\Status\FileAgeScan\Config\FileAgeScanConfig.csv",
+
+    [string]$LogDirectory = "C:\Status\FileAgeScan\Logs",
+
+    [string]$ResultCsvPath = "C:\Status\FileAgeScan\Results\FileAgeScanResults.csv",
+
+    [switch]$DetailedLog
+)
+
+$script:LogPath = Join-Path -Path $LogDirectory -ChildPath ("FileAgeScan_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+
+function Write-Log {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Message
+    )
+
+    $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
+    $line = "{0} : {1}" -f $timestamp, $Message
+    Write-Host $line
+    Add-Content -Path $script:LogPath -Value $line -Encoding UTF8
+}
+
+function Format-Size {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Int64]$Bytes
+    )
+
+    if ($Bytes -ge 1TB) { return ("{0:N2} TB" -f ($Bytes / 1TB)) }
+    elseif ($Bytes -ge 1GB) { return ("{0:N2} GB" -f ($Bytes / 1GB)) }
+    elseif ($Bytes -ge 1MB) { return ("{0:N2} MB" -f ($Bytes / 1MB)) }
+    elseif ($Bytes -ge 1KB) { return ("{0:N2} KB" -f ($Bytes / 1KB)) }
+    else { return ("{0} Bytes" -f $Bytes) }
+}
+
+function Convert-ToBool {
+    param(
+        [string]$Value
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Value)) {
+        return $false
+    }
+
+    switch ($Value.Trim().ToLower()) {
+        "true" { return $true }
+        "1"    { return $true }
+        "yes"  { return $true }
+        "ja"   { return $true }
+        default { return $false }
+    }
+}
+
+function Normalize-Extensions {
+    param(
+        [string]$Extensions
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Extensions)) {
+        return @()
+    }
+
+    $normalized = $Extensions -split '[|,; ]+' |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        ForEach-Object {
+            $ext = $_.Trim().ToLower()
+            if ($ext -notmatch '^\.') { ".$ext" } else { $ext }
+        } |
+        Select-Object -Unique
+
+    return @($normalized)
+}
+
+try {
+    if (-not (Test-Path -LiteralPath $LogDirectory)) {
+        New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
+    }
+
+    if (-not (Test-Path -LiteralPath $ConfigCsvPath)) {
+        throw ("Config-CSV nicht gefunden: {0}" -f $ConfigCsvPath)
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($ResultCsvPath)) {
+        $resultDir = Split-Path -Path $ResultCsvPath -Parent
+        if (-not [string]::IsNullOrWhiteSpace($resultDir) -and -not (Test-Path -LiteralPath $resultDir)) {
+            New-Item -Path $resultDir -ItemType Directory -Force | Out-Null
+        }
+    }
+
+    $configRows = Import-Csv -Path $ConfigCsvPath -Delimiter ';'
+
+    if (-not $configRows -or @($configRows).Count -eq 0) {
+        throw "Die Config-CSV enthaelt keine Datensaetze."
+    }
+
+    Write-Log "============================================================"
+    Write-Log "Datei-Alterspruefung gestartet"
+    Write-Log ("ConfigCsvPath : {0}" -f $ConfigCsvPath)
+    Write-Log ("LogPath       : {0}" -f $script:LogPath)
+    if (-not [string]::IsNullOrWhiteSpace($ResultCsvPath)) {
+        Write-Log ("ResultCsvPath : {0}" -f $ResultCsvPath)
+    }
+    Write-Log "============================================================"
+
+    $allResults = New-Object System.Collections.Generic.List[object]
+    $overallProcessedJobs = 0
+    $overallFileCount = 0
+    [Int64]$overallBytes = 0
+
+    foreach ($row in $configRows) {
+        $jobName    = $row.Name
+        $rootPath   = $row.RootPath
+        $extensions = Normalize-Extensions -Extensions $row.Extensions
+        $enabled    = Convert-ToBool -Value $row.Enabled
+
+        if ([string]::IsNullOrWhiteSpace($jobName)) {
+            $jobName = "UnbenannterJob"
+        }
+
+        if (-not $enabled) {
+            Write-Log ("Job uebersprungen (deaktiviert): {0}" -f $jobName)
+            continue
+        }
+
+        if ([string]::IsNullOrWhiteSpace($rootPath)) {
+            Write-Log ("FEHLER: Job '{0}' hat keinen RootPath." -f $jobName)
+            continue
+        }
+
+        if (-not (Test-Path -LiteralPath $rootPath)) {
+            Write-Log ("FEHLER: Pfad nicht gefunden fuer Job '{0}' -> {1}" -f $jobName, $rootPath)
+            continue
+        }
+
+        if (-not $extensions -or $extensions.Count -eq 0) {
+            Write-Log ("FEHLER: Keine gueltigen Dateitypen fuer Job '{0}'." -f $jobName)
+            continue
+        }
+
+        $olderThanYears = 10
+        if ($row.OlderThanYears -match '^\d+$') {
+            $olderThanYears = [int]$row.OlderThanYears
+        }
+
+        $dateProperty = "LastWriteTime"
+        if ($row.DateProperty -in @("CreationTime", "LastWriteTime", "LastAccessTime")) {
+            $dateProperty = $row.DateProperty
+        }
+
+        $cutoffDate = (Get-Date).AddYears(-$olderThanYears)
+
+        Write-Log "------------------------------------------------------------"
+        Write-Log ("Job              : {0}" -f $jobName)
+        Write-Log ("Pfad             : {0}" -f $rootPath)
+        Write-Log ("Dateitypen       : {0}" -f ($extensions -join ', '))
+        Write-Log ("Aelter als       : {0} Jahr(e)" -f $olderThanYears)
+        Write-Log ("Datumsfeld       : {0}" -f $dateProperty)
+        Write-Log ("Grenzdatum       : {0}" -f $cutoffDate.ToString('yyyy-MM-dd HH:mm:ss'))
+        Write-Log "------------------------------------------------------------"
+
+        $jobResults = New-Object System.Collections.Generic.List[object]
+
+        Get-ChildItem -LiteralPath $rootPath -File -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+            $file = $_
+
+            try {
+                $extension = $file.Extension.ToLower()
+
+                if ($extensions -contains $extension) {
+                    $fileDate = $file.$dateProperty
+
+                    if ($fileDate -lt $cutoffDate) {
+                        $result = [PSCustomObject]@{
+                            JobName        = $jobName
+                            RootPath       = $rootPath
+                            FullName       = $file.FullName
+                            Name           = $file.Name
+                            Extension      = $extension
+                            SizeBytes      = [Int64]$file.Length
+                            SizeFormatted  = Format-Size -Bytes $file.Length
+                            CreationTime   = $file.CreationTime
+                            LastWriteTime  = $file.LastWriteTime
+                            LastAccessTime = $file.LastAccessTime
+                            UsedDate       = $fileDate
+                            OlderThanYears = $olderThanYears
+                            DateProperty   = $dateProperty
+                        }
+
+                        [void]$jobResults.Add($result)
+                        [void]$allResults.Add($result)
+                    }
+                }
+            }
+            catch {
+                Write-Log ("FEHLER bei Datei in Job '{0}': {1} | {2}" -f $jobName, $file.FullName, $_.Exception.Message)
+            }
+        }
+
+        $jobFileCount = $jobResults.Count
+        $jobBytes = ($jobResults | Measure-Object -Property SizeBytes -Sum).Sum
+        if (-not $jobBytes) { $jobBytes = 0 }
+
+        $overallProcessedJobs++
+        $overallFileCount += $jobFileCount
+        $overallBytes += [Int64]$jobBytes
+
+        Write-Log ("Ergebnis Job '{0}': Dateien={1} | Groesse={2} ({3} Bytes)" -f $jobName, $jobFileCount, (Format-Size -Bytes $jobBytes), $jobBytes)
+
+        $grouped = $jobResults | Group-Object -Property Extension | Sort-Object -Property Name
+        foreach ($group in $grouped) {
+            $groupBytes = ($group.Group | Measure-Object -Property SizeBytes -Sum).Sum
+            if (-not $groupBytes) { $groupBytes = 0 }
+
+            Write-Log ("  {0,-10} Anzahl: {1,8} | Groesse: {2}" -f $group.Name, $group.Count, (Format-Size -Bytes $groupBytes))
+        }
+
+        if ($DetailedLog -and $jobFileCount -gt 0) {
+            Write-Log ("Detailtreffer fuer Job '{0}':" -f $jobName)
+            foreach ($item in $jobResults | Sort-Object -Property UsedDate, FullName) {
+                Write-Log ("  {0} | {1} | {2} | {3}" -f `
+                    $item.UsedDate.ToString("yyyy-MM-dd HH:mm:ss"), `
+                    $item.Extension, `
+                    $item.SizeFormatted, `
+                    $item.FullName)
+            }
+        }
+    }
+
+    Write-Log "============================================================"
+    Write-Log "GESAMTZUSAMMENFASSUNG"
+    Write-Log ("Verarbeitete Jobs : {0}" -f $overallProcessedJobs)
+    Write-Log ("Gefundene Dateien : {0}" -f $overallFileCount)
+    Write-Log ("Gesamtgroesse     : {0} ({1} Bytes)" -f (Format-Size -Bytes $overallBytes), $overallBytes)
+    Write-Log "============================================================"
+
+    if (-not [string]::IsNullOrWhiteSpace($ResultCsvPath)) {
+        if ($allResults.Count -gt 0) {
+            $allResults |
+                Sort-Object -Property JobName, UsedDate, FullName |
+                Export-Csv -Path $ResultCsvPath -NoTypeInformation -Encoding UTF8 -Delimiter ';'
+
+            Write-Log ("Ergebnis-CSV exportiert: {0}" -f $ResultCsvPath)
+        }
+        else {
+            Write-Log "Keine Treffer vorhanden, Ergebnis-CSV wurde nicht geschrieben."
+        }
+    }
+
+    Write-Log "Pruefung abgeschlossen"
+}
+catch {
+    Write-Error $_.Exception.Message
+
+    try {
+        if (-not (Test-Path -LiteralPath $LogDirectory)) {
+            New-Item -Path $LogDirectory -ItemType Directory -Force | Out-Null
+        }
+
+        if (-not (Get-Variable -Name LogPath -Scope Script -ErrorAction SilentlyContinue)) {
+            $script:LogPath = Join-Path -Path $LogDirectory -ChildPath ("FileAgeScan_{0}.log" -f (Get-Date -Format "yyyyMMdd_HHmmss"))
+        }
+
+        Write-Log ("KRITISCHER FEHLER: {0}" -f $_.Exception.Message)
+    }
+    catch {
+        Write-Error ("Log konnte nicht geschrieben werden: {0}" -f $_.Exception.Message)
+    }
+}
